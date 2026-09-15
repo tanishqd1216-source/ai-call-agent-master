@@ -1,0 +1,222 @@
+// Prisma schema for the Meridian dashboard's persistence layer.
+// Postgres (Neon in production). Prisma 7's driver-adapter architecture means
+// a provider swap also requires swapping the adapter class in
+// src/lib/prisma.ts and prisma/seed.ts (see @prisma/adapter-pg there) — this
+// datasource line alone is not the whole migration.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Call {
+  id         String    @id @default(cuid())
+  callId     String    @unique
+  direction  String
+  status     String    @default("in_progress")
+  phase      String?
+  category   String?
+  resolution String?
+  owner      String?
+  pet        String?
+  service    String?
+  clinic     String?
+  city       String?
+  startedAt  DateTime  @default(now())
+  endedAt    DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  turns  CallTurn[]
+  events CallEvent[]
+
+  @@index([direction])
+  @@index([category])
+  @@index([startedAt])
+}
+
+model CallTurn {
+  id                        String   @id @default(cuid())
+  call                      Call     @relation(fields: [callId], references: [callId])
+  callId                    String
+  turn                      Int
+  speechId                  String?
+  eouDelaySeconds           Float?
+  transcriptionDelaySeconds Float?
+  llmTtftSeconds            Float?
+  ttsTtfbSeconds            Float?
+  responseLatencySeconds    Float?
+  inputTokens               Int?
+  outputTokens              Int?
+  createdAt                 DateTime @default(now())
+
+  @@index([callId])
+}
+
+model CallEvent {
+  id        String   @id @default(cuid())
+  call      Call     @relation(fields: [callId], references: [callId])
+  callId    String
+  eventType String
+  payload   String?
+  createdAt DateTime @default(now())
+
+  @@index([callId])
+  @@index([eventType])
+}
+
+// --- ERP access flow: login -> company verification -> department/agent picker ---
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users        User[]
+  integrations Integration[]
+
+  @@index([name])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  company      Company  @relation(fields: [companyId], references: [id])
+  companyId    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions Session[]
+
+  @@index([companyId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Department {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agents Agent[]
+
+  @@index([sortOrder])
+}
+
+model Agent {
+  id           String     @id @default(cuid())
+  name         String
+  description  String?
+  launchUrl    String?
+  sortOrder    Int        @default(0)
+  department   Department @relation(fields: [departmentId], references: [id])
+  departmentId String
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([departmentId])
+  @@index([sortOrder])
+}
+
+// --- CRM / MCP connections. "kind" is a UI label only — both crm and mcp
+// connections are wired the same way, as an MCP server endpoint the voice
+// agent connects to at call time (see livekit_agent/integrations_loader.py). ---
+
+model Integration {
+  id           String   @id @default(cuid())
+  company      Company  @relation(fields: [companyId], references: [id])
+  companyId    String
+  name         String
+  kind         String // "crm" | "mcp"
+  provider     String // "hubspot" | "salesforce" | "zoho" | "custom", free text
+  serverUrl    String
+  transport    String   @default("streamable_http") // matches MCPServerHTTP transport_type
+  authToken    String? // AES-256-GCM ciphertext — never returned decrypted over the API
+  allowedTools String[] @default([]) // empty = all tools exposed
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([companyId])
+}
+
+// --- Eval harness: golden-set runs graded by an LLM judge against the calling
+// agent's own business rules (see livekit_agent/tests/eval/). Deliberately NOT
+// linked to Call — these are simulated transcripts, not real LiveKit calls, and
+// linking them would conflate synthetic eval data with real call telemetry in
+// /calls-history's stats. Pass rates are computed on read, not stored redundantly. ---
+
+model PromptVersion {
+  id         String   @id @default(cuid())
+  direction  String // "inbound" | "outbound"
+  label      String
+  promptHash String
+  promptText String
+  source     String   @default("baseline") // "baseline" | "variant"
+  notes      String?
+  createdAt  DateTime @default(now())
+
+  evalRuns EvalRun[]
+
+  @@unique([direction, promptHash])
+  @@index([direction])
+}
+
+model EvalRun {
+  id              String        @id @default(cuid())
+  direction       String
+  promptVersion   PromptVersion @relation(fields: [promptVersionId], references: [id])
+  promptVersionId String
+  judgeModel      String
+  agentModel      String
+  status          String        @default("running") // running | completed | failed
+  startedAt       DateTime      @default(now())
+  completedAt     DateTime?
+
+  results EvalResult[]
+
+  @@index([direction])
+  @@index([promptVersionId])
+}
+
+model EvalResult {
+  id             String   @id @default(cuid())
+  run            EvalRun  @relation(fields: [runId], references: [id])
+  runId          String
+  caseId         String
+  caseLabel      String?
+  caseType       String? // taxonomy | regression | edge_case | security
+  verdict        String // PASS | FAIL | ERROR
+  violatedRules  String[] @default([])
+  judgeReasoning String?
+  transcript     String
+  turnCount      Int?
+  inputTokens    Int?
+  outputTokens   Int?
+  latencyMs      Int?
+  createdAt      DateTime @default(now())
+
+  @@index([runId])
+  @@index([verdict])
+}
